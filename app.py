@@ -1,13 +1,15 @@
-from flask import Flask, request, render_template, flash, redirect, url_for, Response
-
+from flask import Flask, request, render_template, flash, redirect, url_for, Response, session
 import os
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image
 import numpy as np
 import imagehash
 from io import BytesIO
 from pymongo import MongoClient
+from bson import ObjectId
 import base64
+import mimetypes
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tu_clave_secreta_aqui'
@@ -15,19 +17,20 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
 # Configuración de MongoDB
-
-#client = MongoClient('mongodb://localhost:27017/')
-#db = client['image_gallery']
-#images_collection = db['images']
-
-
 mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017/image_gallery')
 client = MongoClient(mongo_uri)
 db = client.get_database()
 images_collection = db.images
 
+# Configuración para el administrador
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD_HASH = generate_password_hash('adminpassword')  # Contraseña del admin
+
+
+# Validación de archivos permitidos
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 
 def calculate_block_entropy(data, block_size=8):
     h, w = data.shape
@@ -130,16 +133,12 @@ def validate_image(file_stream):
         print(f"Error: {str(e)}")
         return False, f"Error en validación: {str(e)}"
 
+
+# Rutas
 @app.route('/')
 def index():
-    uploaded_images = []
-    if os.path.exists(app.config['UPLOAD_FOLDER']):
-        uploaded_images = [f for f in os.listdir(app.config['UPLOAD_FOLDER']) 
-                          if f.lower().endswith(tuple(ALLOWED_EXTENSIONS))]
-    
-    # Obtiene las imágenes desde la base de datos
-    images_from_db = images_collection.find()
-    return render_template('index.html', images=images_from_db, uploaded_images=uploaded_images)
+    approved_images = images_collection.find({'status': 'aprobada'})
+    return render_template('index.html', images=approved_images)
 
 
 @app.route('/upload', methods=['POST'])
@@ -147,68 +146,118 @@ def upload_file():
     if 'file' not in request.files or 'alias' not in request.form:
         flash('No se seleccionó archivo o falta el alias')
         return redirect(url_for('index'))
-    
+
     file = request.files['file']
     alias = request.form['alias'].strip()
-    
+
     if file.filename == '':
         flash('No se seleccionó archivo')
         return redirect(url_for('index'))
-    
+
     if file and allowed_file(file.filename):
         file_copy = BytesIO(file.read())
         is_valid, message = validate_image(file_copy)
-        
+
+        # Mostrar el mensaje de validación, pero no se sube aún
         if not is_valid:
-            flash(f'Imagen rechazada: {message}')
-            return redirect(url_for('index'))
-        
+            flash(f'Imagen rechazada: {message} , pendiente de aprobación del administrador', 'error')
+        else:
+         
+            flash('Imagen válida, pendiente de aprobación del administrador', 'success')
+
+
+        # Guardar la imagen en estado pendiente para revisión del administrador
         filename = secure_filename(file.filename)
         file_copy.seek(0)
-        
-        # Guardar la imagen en MongoDB
         image_data = file_copy.read()
+
         image_record = {
             'filename': filename,
             'alias': alias,
-            'image_data': image_data
+            'image_data': image_data,
+            'status': 'pendiente',  # Estado pendiente para revisión
+            'reviewed_by_admin': False,  # Indicamos que no ha sido revisada
         }
         images_collection.insert_one(image_record)
-        
-        flash('Archivo subido exitosamente')
+
         return redirect(url_for('index'))
-    
+
     flash('Tipo de archivo no permitido')
     return redirect(url_for('index'))
 
-import mimetypes
 
-from bson import ObjectId
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
+            session['admin_logged_in'] = True
+            flash('Inicio de sesión exitoso', 'success')
+            return redirect(url_for('admin_dashboard'))
+        else:
+            flash('Usuario o contraseña incorrectos', 'error')
+    return render_template('admin_login.html')
 
-@app.route('/image/<image_id>')
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin_logged_in', None)
+    flash('Cierre de sesión exitoso', 'success')
+    return redirect(url_for('index'))
+
+@app.route('/get_image/<image_id>')
 def get_image(image_id):
+    image = images_collection.find_one({'_id': ObjectId(image_id)})
+    if image:
+        return Response(image['image_data'], mimetype='image/jpeg')
+    else:
+        return 'Imagen no encontrada', 404
+
+
+
+
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    if not session.get('admin_logged_in'):
+        flash('Debe iniciar sesión como administrador', 'error')
+        return redirect(url_for('admin_login'))
+
+    pending_images = images_collection.find({'status': 'pendiente'})
+    return render_template('admin_dashboard.html', images=pending_images)
+
+
+@app.route('/admin/review/<image_id>/<action>', methods=['POST'])
+def review_image(image_id, action):
+    if not session.get('admin_logged_in'):
+        flash('Debe iniciar sesión como administrador', 'error')
+        return redirect(url_for('admin_login'))
+
     try:
-        # convertir el ID en un ObjectId válido de MongoDB
         image_id_obj = ObjectId(image_id)
         image = images_collection.find_one({'_id': image_id_obj})
+        if not image:
+            flash('Imagen no encontrada', 'error')
+            return redirect(url_for('admin_dashboard'))
 
-        if image:
-            mime_type, _ = mimetypes.guess_type(image['filename'])
-            if not mime_type:
-                mime_type = 'application/octet-stream'  # Tipo por defecto
-            return Response(image['image_data'], mimetype=mime_type)
-        
-        return 'Imagen no encontrada', 404
+        if action == 'approve':
+            images_collection.update_one(
+                {'_id': image_id_obj},
+                {'$set': {'status': 'aprobada', 'reviewed_by_admin': True}}
+            )
+            flash('Imagen aprobada exitosamente', 'success')
+        elif action == 'reject':
+            images_collection.update_one(
+                {'_id': image_id_obj},
+                {'$set': {'status': 'rechazada', 'reviewed_by_admin': True}}
+            )
+            flash('Imagen rechazada', 'error')
+
+        return redirect(url_for('admin_dashboard'))
     except Exception as e:
-        return f"Error: {str(e)}", 500
-    
-    
+        flash(f'Error al procesar la solicitud: {str(e)}', 'error')
+        return redirect(url_for('admin_dashboard'))
+
+
+
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
-
-
-# if __name__ == '__main__':
- #    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
- #    app.run(debug=True)
- 
- 
